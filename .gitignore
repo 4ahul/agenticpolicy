@@ -30,5 +30,8 @@ coverage.xml
 .DS_Store
 *.db
 *.sqlite3
-*.jsonl
+# Audit exports written by EventStore.export_jsonl(), not eval fixtures.
+# A blanket *.jsonl would silently swallow any test data added later.
+audit*.jsonl
+*_export.jsonl
 .env

@@ -108,7 +108,7 @@ def _cmd_test(args: argparse.Namespace) -> int:
             print(f"FAIL: expected {args.expect}, got {actual}", file=sys.stderr)
             return 1
         print(f"OK: expected {args.expect}")
-    return 0 if decision.allowed or not args.expect else 0
+    return 0
 
 
 def _cmd_catalog(args: argparse.Namespace) -> int:

@@ -50,6 +50,19 @@ jobs:
           cache: pip
       - name: Install with frameworks
         run: pip install -e ".[dev,integrations]"
+      - name: Confirm the adapter tests actually ran
+        # tests/test_adapters.py skips when a framework is missing. Without this
+        # gate a broken extra would look like a green build.
+        run: |
+          python - <<'PY'
+          import importlib.util, sys
+          missing = [m for m in ("langchain_core", "langchain.agents", "langgraph",
+                                 "llama_index.core")
+                     if importlib.util.find_spec(m) is None]
+          if missing:
+              sys.exit(f"integrations extra did not install: {missing}")
+          print("all frameworks present")
+          PY
       - name: Test
         run: pytest -q
 

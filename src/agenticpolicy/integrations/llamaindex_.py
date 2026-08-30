@@ -11,7 +11,8 @@ before handing them to the agent.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import inspect
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from agenticpolicy.core.engine import PolicyEngine
@@ -21,6 +22,34 @@ from agenticpolicy.exceptions import IntegrationNotInstalled
 from agenticpolicy.integrations.base import ToolGuard
 
 __all__ = ["GuardedLlamaIndexAgent", "guard_llamaindex_tool", "guard_llamaindex_tools"]
+
+
+def _build_agent(agent_cls: Any, tools: list[Any], kwargs: dict[str, Any]) -> Any:
+    """Construct a LlamaIndex agent across framework versions.
+
+    0.12+ takes ``tools=`` on the constructor; earlier releases used the
+    ``from_tools`` classmethod. Each form is tried in turn and the last error
+    is re-raised, so a genuine mistake in ``agent_kwargs`` still surfaces
+    instead of being swallowed as a version mismatch.
+    """
+    attempts: list[Callable[[], Any]] = [
+        lambda: agent_cls(tools=tools, **kwargs),
+        lambda: agent_cls(tools, **kwargs),
+    ]
+    builder = getattr(agent_cls, "from_tools", None)
+    if builder is not None:
+        attempts.insert(0, lambda: builder(tools, **kwargs))
+
+    last: Exception | None = None
+    for attempt in attempts:
+        try:
+            return attempt()
+        except TypeError as exc:
+            last = exc
+    raise TypeError(
+        f"Could not construct {agent_cls.__name__} with the guarded tools. "
+        f"Pass a prebuilt agent to GuardedLlamaIndexAgent(...) instead. Last error: {last}"
+    ) from last
 
 
 def _require_llamaindex() -> Any:
@@ -49,14 +78,19 @@ def guard_llamaindex_tool(
     if action is not None:
         guard.action_map[name] = ActionType.coerce(action)
 
-    underlying = getattr(tool, "fn", None) or (lambda *a, **kw: tool(*a, **kw))
-    guarded_fn = guard.wrap(underlying, name=name)
+    sync_fn = getattr(tool, "fn", None)
+    async_fn = getattr(tool, "async_fn", None)
+    if sync_fn is None and async_fn is None:
+        # Older builds expose only __call__.
+        sync_fn = tool.call
 
     return FunctionTool.from_defaults(
-        fn=guarded_fn,
+        fn=guard.wrap(sync_fn, name=name) if sync_fn is not None else None,
+        async_fn=guard.wrap(async_fn, name=name) if async_fn is not None else None,
         name=name,
         description=metadata.description,
         fn_schema=getattr(metadata, "fn_schema", None),
+        return_direct=getattr(metadata, "return_direct", False),
     )
 
 
@@ -140,21 +174,42 @@ class GuardedLlamaIndexAgent:
 
             agent_cls = ReActAgent
 
-        builder = getattr(agent_cls, "from_tools", None)
-        agent = (
-            builder(guarded_tools, **agent_kwargs)
-            if builder
-            else agent_cls(guarded_tools, **agent_kwargs)
-        )
+        # LlamaIndex 0.12 dropped ``from_tools`` in favour of a keyword
+        # constructor. Try the modern form first, then the legacy builder, so
+        # one adapter spans both without pinning the framework version.
+        agent = _build_agent(agent_cls, guarded_tools, agent_kwargs)
         return cls(agent, _guard=guard)
 
     # ------------------------------------------------------------ delegation
 
     def chat(self, message: str, **kwargs: Any) -> Any:
-        return self.agent.chat(message, **kwargs)
+        """Send a message to the agent.
+
+        LlamaIndex 0.12 replaced ``chat()`` with the workflow-style ``run()``,
+        so whichever the installed version offers is used. Both return the
+        framework's own response object untouched.
+        """
+        for method in ("chat", "run"):
+            fn = getattr(self.agent, method, None)
+            if callable(fn):
+                return fn(message, **kwargs)
+        raise AttributeError(
+            f"{type(self.agent).__name__} exposes neither chat() nor run(); "
+            "call the agent directly via .agent"
+        )
 
     async def achat(self, message: str, **kwargs: Any) -> Any:
-        return await self.agent.achat(message, **kwargs)
+        """Async counterpart of :meth:`chat`.
+
+        ``AgentWorkflow.run`` returns an awaitable handler, so the result is
+        awaited when it is one and returned as-is otherwise.
+        """
+        for method in ("achat", "arun", "run"):
+            fn = getattr(self.agent, method, None)
+            if callable(fn):
+                result = fn(message, **kwargs)
+                return await result if inspect.isawaitable(result) else result
+        raise AttributeError(f"{type(self.agent).__name__} exposes no async chat entry point")
 
     def query(self, message: str, **kwargs: Any) -> Any:
         return self.agent.query(message, **kwargs)

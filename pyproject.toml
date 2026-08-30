@@ -41,23 +41,30 @@ dev = [
 langchain = ["langchain>=0.1", "langchain-core>=0.1"]
 llamaindex = ["llama-index-core>=0.10"]
 langgraph = ["langgraph>=0.1"]
+# Used by CI. Pinned to the majors the adapter tests exercise: LangChain 1.x
+# replaced AgentExecutor with create_agent, and LlamaIndex 0.12 replaced
+# ReActAgent.from_tools with a keyword constructor. The adapters handle both
+# eras, but only the newer one can be tested without pinning backwards.
 integrations = [
-    "langchain>=0.1",
-    "langchain-core>=0.1",
-    "llama-index-core>=0.10",
-    "langgraph>=0.1",
+    "langchain>=1.0",
+    "langchain-core>=0.3",
+    "llama-index-core>=0.12",
+    "langgraph>=0.2",
 ]
 
 [project.urls]
-Homepage = "https://github.com/rahulsagar/agenticpolicy"
-Documentation = "https://github.com/rahulsagar/agenticpolicy/tree/main/docs"
-"Bug Tracker" = "https://github.com/rahulsagar/agenticpolicy/issues"
+Homepage = "https://github.com/4ahul/agenticpolicy-"
+Documentation = "https://github.com/4ahul/agenticpolicy-/tree/main/docs"
+"Bug Tracker" = "https://github.com/4ahul/agenticpolicy-/issues"
 
 [project.scripts]
 agenticpolicy = "agenticpolicy.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+agenticpolicy = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

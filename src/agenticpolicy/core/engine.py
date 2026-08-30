@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable
 from functools import lru_cache
 from typing import Any
@@ -152,6 +152,13 @@ class PolicyEngine:
     its own engine.
     """
 
+    #: Cap on evaluated-but-not-yet-charged calls held in memory. A call is
+    #: normally discarded within microseconds, on :meth:`commit` or
+    #: :meth:`discard`; the cap only matters for a caller that uses the engine
+    #: directly and does neither, where an unbounded dict would be a slow leak
+    #: in a long-running process.
+    MAX_PENDING = 4096
+
     def __init__(
         self,
         policy: Policy,
@@ -162,7 +169,7 @@ class PolicyEngine:
         self.policy = policy
         self.store = store
         self.budgets = BudgetTracker(clock=clock)
-        self._pending_budget: dict[str, list[PolicyRule]] = {}
+        self._pending_budget: OrderedDict[str, list[PolicyRule]] = OrderedDict()
 
     # ------------------------------------------------------------ pre-call
 
@@ -260,12 +267,19 @@ class PolicyEngine:
                 )
 
         # 6. Allowed. Note which budgeted rules to charge once the call runs.
-        self._pending_budget[tool_call.id] = [
+        pending = [
             rule
             for rule in self.policy.approve_rules
             if rule.budget
             and self.policy.matches_rule(rule, tool_call.action, tool_call.resource, *sources)
         ]
+        if pending:
+            self._pending_budget[tool_call.id] = pending
+            while len(self._pending_budget) > self.MAX_PENDING:
+                # Oldest first. A call this stale was abandoned without a
+                # commit, so dropping it forfeits the charge rather than
+                # growing forever.
+                self._pending_budget.popitem(last=False)
         return PolicyDecision.allow(
             f"Allowed by rule {matched.id}",
             rule_applied=matched.id,
@@ -281,6 +295,15 @@ class PolicyEngine:
         task_id = str(tool_call.context.get("task_id", ""))
         for rule in self._pending_budget.pop(tool_call.id, []):
             self.budgets.record(tool_call.agent_id, rule, task_id)
+
+    def discard(self, tool_call: ToolCall) -> None:
+        """Forget a call that was allowed but never executed.
+
+        Idempotent, and a no-op after :meth:`commit`. Guards call this in a
+        ``finally`` so a tool that raises releases its reservation instead of
+        leaving it pinned in memory for the life of the process.
+        """
+        self._pending_budget.pop(tool_call.id, None)
 
     # ----------------------------------------------------------- post-call
 

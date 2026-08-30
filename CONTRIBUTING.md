@@ -5,7 +5,7 @@ Thanks for looking. This is a security library, so a few things matter more here
 ## Setup
 
 ```bash
-git clone https://github.com/rahulsagar/agenticpolicy
+git clone https://github.com/4ahul/agenticpolicy-
 cd agenticpolicy
 pip install -e ".[dev,integrations]"
 pytest

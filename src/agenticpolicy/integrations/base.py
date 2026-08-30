@@ -1,7 +1,7 @@
 """Framework-agnostic guarding logic.
 
 Every integration is a thin adapter over :class:`ToolGuard`, which owns the
-actual sequence — infer what the call is doing, evaluate, run, scan the output,
+actual sequence â€” infer what the call is doing, evaluate, run, scan the output,
 charge the budget. Keeping that here means the interesting logic is testable
 without LangChain, LlamaIndex or LangGraph installed, and the three adapters
 stay small enough to read in one sitting.
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 import re
+from collections import deque
 from collections.abc import Callable
 from typing import Any
 
@@ -79,11 +80,11 @@ _SPLIT = re.compile(r"[_\-.:\s]+")
 def infer_action(tool_name: str, explicit: ActionType | str | None = None) -> ActionType:
     """Guess what a tool does from its name.
 
-    ``salesforce_delete_lead`` → ``DELETE``, ``get_ticket`` → ``READ``. Falls
+    ``salesforce_delete_lead`` â†’ ``DELETE``, ``get_ticket`` â†’ ``READ``. Falls
     back to ``EXECUTE``, the most restricted action, so an unrecognized tool
     name fails closed rather than being treated as a harmless read.
 
-    Pass ``explicit`` to skip inference entirely — always do this for tools
+    Pass ``explicit`` to skip inference entirely â€” always do this for tools
     whose names do not describe their effect.
     """
     if explicit is not None:
@@ -102,8 +103,8 @@ def infer_action(tool_name: str, explicit: ActionType | str | None = None) -> Ac
 def infer_resource(tool_name: str, explicit: str | None = None) -> str:
     """Guess the ``provider:type`` resource a tool touches from its name.
 
-    ``salesforce_read_lead`` → ``salesforce:lead``, ``github_pr`` →
-    ``github:pr``, ``search`` → ``default:search``. Inference is a convenience
+    ``salesforce_read_lead`` â†’ ``salesforce:lead``, ``github_pr`` â†’
+    ``github:pr``, ``search`` â†’ ``default:search``. Inference is a convenience
     for prototyping; in production, register resources explicitly via
     ``ToolGuard(resource_map=...)`` so a renamed tool cannot silently change
     which rules apply to it.
@@ -127,7 +128,7 @@ class ToolGuard:
         policy: The policy to enforce. Ignored if ``engine`` is given.
         engine: An existing engine, when several guards should share budget
             state and one audit store.
-        context: Baseline context merged into every tool call — put ``user_id``
+        context: Baseline context merged into every tool call â€” put ``user_id``
             and ``task_id`` here once instead of threading them through each
             call site.
         resource_map: Explicit ``{tool_name: "provider:type"}`` overrides.
@@ -135,6 +136,12 @@ class ToolGuard:
         on_violation: ``"block"`` returns an explanatory string the agent can
             read and route around; ``"raise"`` raises
             :class:`~agenticpolicy.exceptions.PolicyViolation`.
+        max_decisions: How many recent decisions to keep for :attr:`blocked`
+            and :meth:`report`. This is a rolling window for inspecting a run,
+            not an audit trail â€” a long-lived guard in a web server would
+            otherwise retain every call it ever evaluated. For a durable record,
+            pass an :class:`~agenticpolicy.audit.store.EventStore` to the
+            engine.
 
     Example::
 
@@ -152,6 +159,7 @@ class ToolGuard:
         resource_map: dict[str, str] | None = None,
         action_map: dict[str, ActionType | str] | None = None,
         on_violation: OnViolation = "block",
+        max_decisions: int = 1000,
     ) -> None:
         if engine is None:
             if policy is None:
@@ -165,7 +173,7 @@ class ToolGuard:
         if on_violation not in ("block", "raise"):
             raise ValueError('on_violation must be "block" or "raise"')
         self.on_violation = on_violation
-        self.decisions: list[tuple[ToolCall, PolicyDecision]] = []
+        self.decisions: deque[tuple[ToolCall, PolicyDecision]] = deque(maxlen=max_decisions)
 
     # ------------------------------------------------------------ plumbing
 
@@ -236,9 +244,9 @@ class ToolGuard:
                 return {"args": list(args), **kwargs}
             try:
                 bound = signature.bind_partial(*args, **kwargs)
-                return dict(bound.arguments)
             except TypeError:
                 return {"args": list(args), **kwargs}
+            return _flatten_bound(bound, signature)
 
         if inspect.iscoroutinefunction(fn):
 
@@ -248,16 +256,22 @@ class ToolGuard:
                 self.decisions.append((call, decision))
                 if not decision.allowed:
                     return self._refuse(call, decision)
-                result = await fn(*args, **kwargs)
-                out_decision, safe = self.engine.check_output(call, result)
-                if not out_decision.allowed:
-                    # Record the output-stage refusal too, so report() and
-                    # .blocked account for data stopped on the way back — not
-                    # only calls stopped on the way out.
-                    self.decisions.append((call, out_decision))
-                    return self._refuse(call, out_decision)
-                self.engine.commit(call)
-                return safe
+                try:
+                    result = await fn(*args, **kwargs)
+                    out_decision, safe = self.engine.check_output(call, result)
+                    if not out_decision.allowed:
+                        # Record the output-stage refusal too, so report() and
+                        # .blocked account for data stopped on the way back â€” not
+                        # only calls stopped on the way out.
+                        self.decisions.append((call, out_decision))
+                        return self._refuse(call, out_decision)
+                    self.engine.commit(call)
+                    return safe
+                finally:
+                    # commit() already released it on the success path. This
+                    # covers the tool raising, the output being blocked, and any
+                    # other early exit, so a reservation cannot outlive its call.
+                    self.engine.discard(call)
 
             return _copy_meta(async_wrapper, fn, tool_name)
 
@@ -267,13 +281,16 @@ class ToolGuard:
             self.decisions.append((call, decision))
             if not decision.allowed:
                 return self._refuse(call, decision)
-            result = fn(*args, **kwargs)
-            out_decision, safe = self.engine.check_output(call, result)
-            if not out_decision.allowed:
-                self.decisions.append((call, out_decision))
-                return self._refuse(call, out_decision)
-            self.engine.commit(call)
-            return safe
+            try:
+                result = fn(*args, **kwargs)
+                out_decision, safe = self.engine.check_output(call, result)
+                if not out_decision.allowed:
+                    self.decisions.append((call, out_decision))
+                    return self._refuse(call, out_decision)
+                self.engine.commit(call)
+                return safe
+            finally:
+                self.engine.discard(call)
 
         return _copy_meta(wrapper, fn, tool_name)
 
@@ -306,3 +323,24 @@ def _copy_meta(wrapper: Callable[..., Any], fn: Any, name: str) -> Callable[...,
     wrapper.__doc__ = getattr(fn, "__doc__", None)
     wrapper.__wrapped__ = fn  # type: ignore[attr-defined]
     return wrapper
+
+
+def _flatten_bound(bound: inspect.BoundArguments, signature: inspect.Signature) -> dict[str, Any]:
+    """Turn bound arguments into a flat ``{name: value}`` map for evaluation.
+
+    ``*args``/``**kwargs`` parameters are unpacked rather than left nested. A
+    wrapper declared ``def call(*args, **kwargs)`` would otherwise produce
+    ``{"kwargs": {"amount": 1000}}``, and a condition written against
+    ``amount`` would silently never match â€” a rule that looks enforced and
+    is not.
+    """
+    flat: dict[str, Any] = {}
+    for param_name, value in bound.arguments.items():
+        kind = signature.parameters[param_name].kind
+        if kind is inspect.Parameter.VAR_KEYWORD and isinstance(value, dict):
+            flat.update(value)
+        elif kind is inspect.Parameter.VAR_POSITIONAL:
+            flat["args"] = list(value)
+        else:
+            flat[param_name] = value
+    return flat

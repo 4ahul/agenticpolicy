@@ -241,6 +241,127 @@ class TestToolGuard:
             ToolGuard()
 
 
+class TestLongRunningProcess:
+    """A guard built once and used forever must not accumulate memory.
+
+    The common deployment shape is a module-level guard in a web server, where
+    anything retained per call is retained for the life of the process.
+    """
+
+    def test_decision_history_is_bounded(self) -> None:
+        guard = ToolGuard(PrebuiltRules.read_only(), max_decisions=50)
+        wrapped = guard.wrap(lambda: "x", name="get_thing")
+
+        for _ in range(500):
+            wrapped()
+
+        assert len(guard.decisions) == 50
+        # The newest calls are the ones kept.
+        assert guard.decisions[-1][0].tool_name == "get_thing"
+
+    def test_report_still_works_on_a_trimmed_history(self) -> None:
+        guard = ToolGuard(PrebuiltRules.read_only(), max_decisions=10)
+        blocked = guard.wrap(lambda: "gone", name="delete_thing")
+        for _ in range(20):
+            blocked()
+
+        assert "10 tool call(s) evaluated, 10 blocked" in guard.report()
+
+    def test_a_raising_tool_releases_its_budget_reservation(self) -> None:
+        """A reservation is taken when a call is allowed and released on commit.
+        If the tool raises, ``commit`` never runs — without a ``finally`` the
+        entry stays pinned in the engine for the life of the process."""
+        policy = Policy("x").allow("execute", ["ci:*"])
+        policy.rate_limit("execute", ["ci:*"], per_hour=10_000)
+        engine = PolicyEngine(policy)
+        guard = ToolGuard(engine=engine)
+
+        def flaky() -> str:
+            raise RuntimeError("tool blew up")
+
+        wrapped = guard.wrap(flaky, resource="ci:deploy", action="execute")
+        for _ in range(200):
+            with pytest.raises(RuntimeError):
+                wrapped()
+
+        assert engine._pending_budget == {}
+
+    def test_a_failed_tool_does_not_spend_quota(self) -> None:
+        """Releasing the reservation must not accidentally charge it."""
+        from tests.conftest import FakeClock
+
+        clock = FakeClock()
+        policy = Policy("x").allow("execute", ["ci:*"])
+        policy.rate_limit("execute", ["ci:*"], per_hour=2)
+        engine = PolicyEngine(policy, clock=clock)
+        guard = ToolGuard(engine=engine)
+
+        def flaky() -> str:
+            raise RuntimeError("boom")
+
+        wrapped = guard.wrap(flaky, resource="ci:deploy", action="execute")
+        for _ in range(5):
+            with pytest.raises(RuntimeError):
+                wrapped()
+
+        # None of the failures consumed the budget, so a working call still runs.
+        working = guard.wrap(
+            lambda: "deployed", name="deploy_ok", resource="ci:deploy", action="execute"
+        )
+        assert working() == "deployed"
+
+    def test_blocked_output_releases_the_reservation(self) -> None:
+        policy = Policy("x").allow("read", ["postgres:*"])
+        policy.rate_limit("read", ["postgres:*"], per_hour=10_000)
+        policy.prevent_exfiltration(max_output_kb=1)
+        engine = PolicyEngine(policy)
+        guard = ToolGuard(engine=engine)
+
+        leaky = guard.wrap(lambda: "x" * 5000, name="read_postgres_users")
+        for _ in range(100):
+            assert leaky().startswith("[BLOCKED]")
+
+        assert engine._pending_budget == {}
+
+    async def test_async_tool_releases_its_reservation(self) -> None:
+        policy = Policy("x").allow("execute", ["ci:*"])
+        policy.rate_limit("execute", ["ci:*"], per_hour=10_000)
+        engine = PolicyEngine(policy)
+        guard = ToolGuard(engine=engine)
+
+        async def flaky() -> str:
+            raise RuntimeError("boom")
+
+        wrapped = guard.wrap(flaky, resource="ci:deploy", action="execute")
+        for _ in range(100):
+            with pytest.raises(RuntimeError):
+                await wrapped()
+
+        assert engine._pending_budget == {}
+
+    def test_engine_used_directly_still_cannot_grow_without_bound(self) -> None:
+        """Not everyone goes through ToolGuard. A caller that evaluates and
+        neither commits nor discards gets a capped dict rather than a leak."""
+        from agenticpolicy.core.types import ActionType, ToolCall
+
+        policy = Policy("x").allow("execute", ["ci:*"])
+        policy.rate_limit("execute", ["ci:*"], per_hour=10_000)
+        engine = PolicyEngine(policy)
+
+        for index in range(engine.MAX_PENDING + 500):
+            engine.evaluate_sync(
+                ToolCall(
+                    agent_id="x",
+                    tool_name="deploy",
+                    resource="ci:deploy",
+                    action=ActionType.EXECUTE,
+                    id=f"call-{index}",
+                )
+            )
+
+        assert len(engine._pending_budget) <= engine.MAX_PENDING
+
+
 class TestOptionalDependencies:
     def test_core_imports_without_frameworks(self) -> None:
         """`import agenticpolicy` must not pull in LangChain."""
